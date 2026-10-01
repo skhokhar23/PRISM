@@ -25,41 +25,11 @@ def _resolve_pdb_path(target, pdb_root):
 
 
 def get_asa_complex(target, pdb_root):
-    """Compute relative ASA for the requested chains of a target, computed
-    on those chains IN ISOLATION -- every other chain in the deposited PDB
-    file is removed before the SASA calculation runs, not just filtered out
-    of the results afterward.
+    """Compute relative ASA for the requested chains of a target.
 
     `target` is `{pdb_id}{chain_letters}` (e.g. `3i6eEF`). If no chain letters
-    are provided, all chains are used (nothing is stripped).
+    are provided, all chains are returned.
     Returns `{chain_id: {res_num: rel_asa_percent}}`.
-
-    CHANGE LOG
-    ----------
-    2026-08-10 (root cause behind F7's incomplete fix on acb/ptc, see
-    internship_report_draft.md): every chain not in the requested set is now
-    detached from the structure before `freesasa.calcBioPDB()` runs.
-
-    Why: most targets here (1acb, 2ptc, 1brs, 2pcc...) are deposited as
-    already-bound complexes -- receptor and ligand in one PDB file. Computing
-    SASA on the file as downloaded measures each residue's accessibility
-    WITH its binding partner already in contact, which makes true interface
-    residues read as artificially buried -- partly shielded by the very
-    partner this pipeline is trying to predict binding to. Confirmed
-    directly on 2ptc chain E: several lost interface residues read near 0%
-    with the partner chain present, 10-65% with it removed first (e.g. E192:
-    11.4% -> 64.8%, E193: 0.5% -> 21.9%, E215: 2.2% -> 20.9%). Legacy's
-    NACCESS/POPS-based surface extraction gets 1.000 interface recall on
-    every real chain checked so far, including these same residues, which
-    only makes sense if it isolates the target chain(s) first; this file
-    never did until now.
-
-    This also affects `hotspot.py`'s call (via `get_asa_flat`), where a
-    template like `1a28AB` requests chains A and B together -- both stay
-    present (they're both in the requested set), but any *other* chain that
-    happens to share the same PDB file (e.g. a second copy in the crystal's
-    asymmetric unit) is now correctly excluded too, which was never
-    intended to be included in a 2-chain template's own SASA either.
     """
     pdb_path = _resolve_pdb_path(target, pdb_root)
     chains = [c.upper() for c in target[4:]]
@@ -67,11 +37,6 @@ def get_asa_complex(target, pdb_root):
     parser = PDBParser(QUIET=True)
     try:
         structure = parser.get_structure("target", pdb_path)
-        if chains:
-            model = next(structure.get_models())
-            for chain in list(model):
-                if chain.id not in chains:
-                    model.detach_child(chain.id)
         result, _ = freesasa.calcBioPDB(structure)
         residue_areas = result.residueAreas()
     except Exception as exc:

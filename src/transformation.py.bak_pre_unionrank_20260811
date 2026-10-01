@@ -56,54 +56,12 @@ CHANGE LOG
 
     Set PRISM_TOP_K_REFINE=1 (env var) to reproduce the pre-F10 behaviour
     exactly.
-
-2026-08-11 (Kabsch interface superposition, supervisor's suggestion)
-    New env var `PRISM_TRANSFORM_MODE`. Default "tmalign" reproduces the
-    previous behaviour exactly. Set to "kabsch_interface" to recompute the
-    rigid-body transform with the Kabsch algorithm using only the matched
-    residues that fall inside the template's annotated interface, instead of
-    applying TM-align's own matrix.
-
-    Rationale: TM-align does not produce a Kabsch/RMSD-optimal transform. Per
-    its authors, "the TM-score rotation matrix instead of Kabsch RMSD rotation
-    matrix has been exploited in both heuristic DP iterations and final
-    alignment selection". The TM-score matrix maximises
-    sum 1/(1+(d/d0)^2), which by design contributes almost nothing for distant
-    pairs, so the resulting pose is dominated by the largest well-fitting
-    region of the chain. On a ~245-residue protease that is the bulk fold; the
-    catalytic groove that decides the interaction is ~25 residues and barely
-    influences the fit. Restricting the superposition to interface residues
-    targets the region that actually matters.
-
-    Falls back to TM-align's transform whenever fewer than KABSCH_MIN_PAIRS
-    (default 5, matching legacy MultiProt's SeqBlockMinSize) matched interface
-    residues are available, since a superposition on 2-4 points is unstable.
-    The funnel line reports how often the fallback fired.
-
-    Status when written: UNTESTED on real data. The offline evaluation
-    (filter_score_eval.py) found that acb's and ptc's best-known candidates
-    have HIGH interface Kabsch RMSD, so this mode will move precisely those
-    candidates substantially. Whether that fixes or destroys them is the open
-    question this mode exists to answer. Note separately that Kabsch RMSD
-    used as a *filter or ranking score* was measured and rejected -- it
-    removed the correct candidate on both acb and ptc. That is a different
-    use of the same algorithm and does not bear on this one.
-
-2026-08-10 (defect F9, self-templating leakage)
-    `process_pair_for_template()` now excludes any template whose own PDB
-    entry is the receptor's or ligand's target structure, before any other
-    filtering runs. Confirmed on `nup` (1RRP predicted by a `1rrp*`
-    template, identity transform) and `cei` (7CEI predicted by a `7cei*`
-    template) -- a target trivially matches itself, which is not evidence
-    the pipeline can predict an interaction it doesn't already have the
-    answer to. Legacy already excluded this case; new never did until now.
 """
 
 import os
 import json
 import math
 
-import numpy as np
 import pandas as pd
 
 from .utils import distance_calculator, STANDARD_AA
@@ -114,8 +72,6 @@ HOTSPOT_DIR = "templates/hotspots"
 CONTACTS_DIR = "templates/contacts"
 TRANSFORMATION_DIR = "processed/transformation"
 MERGE_DIR = "processed/output"
-SURFACE_DIR = "processed/surface_extraction"
-INTERFACES_DIR = "templates/interfaces"
 os.makedirs(TRANSFORMATION_DIR, exist_ok=True)
 os.makedirs(MERGE_DIR, exist_ok=True)
 
@@ -153,61 +109,6 @@ MIN_INTERFACE_CONTACTS = 20
 # pre-F10 behaviour exactly (only candidates[0]).
 TOP_K_REFINE = int(os.environ.get("PRISM_TOP_K_REFINE", "5"))
 
-# --- how the rigid-body transform is computed (2026-08-11) ------------------
-# "tmalign"          : use TM-align's own matrix, unchanged. Original behaviour.
-# "kabsch_interface" : recompute the superposition with the Kabsch algorithm
-#                      using ONLY the matched residues that lie in the
-#                      template's annotated interface.
-#
-# Why this option exists: TM-align does not return a Kabsch/RMSD-optimal
-# transform. Its authors state that "the TM-score rotation matrix instead of
-# Kabsch RMSD rotation matrix has been exploited in both heuristic DP
-# iterations and final alignment selection". The TM-score matrix maximises
-# sum 1/(1+(d/d0)^2), which deliberately down-weights distant pairs, so the
-# pose is dominated by the largest well-fitting region. For a ~245-residue
-# enzyme that is the bulk fold, not the ~25-residue catalytic groove that
-# actually decides the interaction. Restricting the superposition to the
-# interface residues optimises the pose for the region that matters.
-#
-# UNTESTED as of writing. Note in particular that the offline evaluation
-# (filter_score_eval.py) found acb's and ptc's best candidates have HIGH
-# interface Kabsch RMSD, so this will move exactly those candidates a long
-# way. That may fix them or may destroy them -- that is what the run is for.
-TRANSFORM_MODE = os.environ.get("PRISM_TRANSFORM_MODE", "tmalign")
-
-# --- which candidates reach refinement (2026-08-11) -------------------------
-# "tm_only"            : top TOP_K_REFINE by alignment score. Original.
-# "union_tm_contacts"  : union of the top TOP_K_REFINE by alignment score AND
-#                        the top TOP_K_REFINE by post-transform interface
-#                        contact count.
-#
-# Measured, not assumed. Offline evaluation over the 2,148 candidates already
-# on disk for brs/pcc/acb/ptc (filter_score_eval.py, rank_fusion_eval.py)
-# gave the rank of each pair's best-known candidate:
-#
-#                      tm_sum   contact_count
-#   ptc  (1shyAB)           3              83
-#   acb  (3agcAB)         451               3
-#   brs  (1b27AD)           1             161
-#   pcc  (1u74AB)           1             242
-#
-# The two signals fail on complementary pairs, so neither works alone: top-3
-# by tm_sum misses acb, and so does top-10 (the setting used elsewhere).
-# Taking the union of the top 3 by each captures the best candidate on all
-# four pairs for 6 refinement calls -- fewer than the 10 that still miss acb.
-#
-# Alternatives that were measured and rejected: consensus/CONSRANK scoring
-# (anti-correlated on all four pairs, r = -0.12 to -0.43 -- the pool's wrong
-# answers are correlated, so consensus converges on a popular wrong patch);
-# reciprocal rank fusion (dilutes the single-list strength this relies on);
-# PRISM's published 0.6*f_hotspot+0.4*f_match (ranks acb's best 415th).
-RANK_MODE = os.environ.get("PRISM_RANK_MODE", "tm_only")
-
-# Minimum number of matched interface residue pairs before a Kabsch
-# superposition is trusted. Below this the fit is unstable and we fall back to
-# TM-align's transform. Legacy's MultiProt uses SeqBlockMinSize = 5.
-KABSCH_MIN_PAIRS = int(os.environ.get("PRISM_KABSCH_MIN_PAIRS", "5"))
-
 # Residue names accepted as protein when reading a transformed PDB. HETATM
 # records are only kept if they name a real residue (MSE, selenomethionine).
 # Waters, ions and ligands are excluded, otherwise a crystallographic water
@@ -228,56 +129,23 @@ def transformer(receptor_targets, ligand_targets):
         f"  [gates] clash < {CLASHING_DISTANCE} A (CA-CA) | "
         f"contact <= {CONTACT_DISTANCE} A (heavy atom) | "
         f"min interface contacts = {MIN_INTERFACE_CONTACTS} | "
-        f"refine top {TOP_K_REFINE} candidate(s) | "
-        f"transform = {TRANSFORM_MODE}"
-        + (f" (kabsch min pairs = {KABSCH_MIN_PAIRS})"
-           if TRANSFORM_MODE == "kabsch_interface" else "")
+        f"refine top {TOP_K_REFINE} candidate(s)"
         + ("  (contact check DISABLED)" if MIN_INTERFACE_CONTACTS <= 0 else "")
     )
     accepted = []
     for receptor, ligand in zip(receptor_targets, ligand_targets):
         candidates = process_pair_for_template(receptor, ligand)
         if candidates:
-            top = select_for_refinement(candidates)
+            top = candidates[:TOP_K_REFINE]
             print(
-                f"  {receptor}+{ligand}: sending {len(top)} of {len(candidates)} "
-                f"candidates to refinement (rank mode={RANK_MODE}, "
-                f"top score={top[0]['score']:.4f} contacts={top[0]['contacts']})"
+                f"  {receptor}+{ligand}: sending top {len(top)} of {len(candidates)} "
+                f"candidates to refinement (top score={top[0]['score']:.4f} "
+                f"contacts={top[0]['contacts']})"
             )
             _print_candidate_table(candidates)
             for cand in top:
                 accepted.append((receptor, ligand, cand["template"], cand["output_pdb"]))
     return accepted
-
-
-def select_for_refinement(candidates, k=None):
-    """Which candidates get sent to refinement.
-
-    `tm_only` keeps the historical behaviour: the top `k` by alignment score,
-    relying on `candidates` already being sorted that way.
-
-    `union_tm_contacts` also takes the top `k` by post-transform interface
-    contact count and unions the two, de-duplicated. Order is preserved with
-    the alignment-score picks first, so a shrinking `k` degrades gracefully
-    back toward the original behaviour rather than reshuffling everything.
-    """
-    k = TOP_K_REFINE if k is None else k
-    if not candidates or k <= 0:
-        return []
-    if RANK_MODE != "union_tm_contacts":
-        return candidates[:k]
-
-    by_score = sorted(candidates, key=lambda c: c["score"], reverse=True)[:k]
-    by_contacts = sorted(candidates, key=lambda c: c["contacts"], reverse=True)[:k]
-
-    picked, seen = [], set()
-    for cand in list(by_score) + list(by_contacts):
-        key = (cand["template"], cand["rec_chain"], cand["lig_chain"])
-        if key in seen:
-            continue
-        seen.add(key)
-        picked.append(cand)
-    return picked
 
 
 def _print_candidate_table(candidates, limit=10):
@@ -378,121 +246,6 @@ def _parse_vec(val, default):
     return val if val is not None else default
 
 
-# ---------------------------------------------------------------------------
-# Kabsch superposition on the interface subset (2026-08-11)
-# ---------------------------------------------------------------------------
-
-_CA_CACHE = {}
-
-
-def _read_ca_map(path):
-    """{(chain, resnum): (x, y, z)} for CA atoms. Cached -- the surface file is
-    the same for every candidate of a target, and each template interface file
-    is reused across many candidates."""
-    if path in _CA_CACHE:
-        return _CA_CACHE[path]
-    out = {}
-    if os.path.exists(path):
-        with open(path) as fh:
-            for line in fh:
-                if not line.startswith(("ATOM", "HETATM")) or len(line) < 54:
-                    continue
-                if line[12:16].strip() != "CA":
-                    continue
-                try:
-                    out[(line[21], int(line[22:26]))] = (
-                        float(line[30:38]), float(line[38:46]), float(line[46:54]))
-                except ValueError:
-                    continue
-    _CA_CACHE[path] = out
-    return out
-
-
-def kabsch_superpose(P, Q):
-    """Rigid transform taking point set P onto Q, minimising RMSD.
-
-    Rows of P and Q are already paired. Returns `(rotation_3x3, translation_3,
-    rmsd)` such that `Q ~= rotation @ P + translation`, i.e. the same direction
-    and convention as TM-align's stored matrix, so the result can be handed
-    straight to `apply_tm_transform`.
-
-    The `d` sign correction rejects improper rotations (reflections), which
-    would otherwise produce a mirrored structure with a deceptively low RMSD.
-    Verified against Bio.SVDSuperimposer to within 1e-9.
-    """
-    P = np.asarray(P, dtype=float)
-    Q = np.asarray(Q, dtype=float)
-    Pc, Qc = P.mean(0), Q.mean(0)
-    H = (P - Pc).T @ (Q - Qc)
-    U, _S, Vt = np.linalg.svd(H)
-    d = np.sign(np.linalg.det(Vt.T @ U.T))
-    R = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
-    diff = (R @ (P - Pc).T).T - (Q - Qc)
-    rmsd = float(np.sqrt((diff ** 2).sum() / len(P)))
-    return R, Qc - R @ Pc, rmsd
-
-
-def _interface_residues_by_side(template, contacts):
-    """(side_for_first_chain, side_for_second_chain) template residue numbers.
-
-    `contacts` is the flat list of [res_first_chain, res_second_chain] pairs
-    written by contact.get_contacts(), whose chain order follows the template
-    id (e.g. `1a28AB` -> first chain A, second chain B).
-    """
-    a, b = set(), set()
-    for pair in contacts:
-        if len(pair) != 2:
-            continue
-        try:
-            a.add(int(pair[0]))
-            b.add(int(pair[1]))
-        except (TypeError, ValueError):
-            continue
-    return a, b
-
-
-def _kabsch_transform(target, template, chain, match_dict, interface_residues):
-    """Kabsch transform for one side, restricted to matched interface residues.
-
-    Returns `(translation_list, rotation_list, rmsd, n_pairs)` or None when
-    there is not enough to work with, in which case the caller keeps
-    TM-align's own transform.
-    """
-    if not match_dict:
-        return None
-    tmpl_ca = _read_ca_map(os.path.join(INTERFACES_DIR, f"{template}_{chain}_int.pdb"))
-    tgt_ca = _read_ca_map(os.path.join(SURFACE_DIR, f"{target}.asa.pdb"))
-    if not tmpl_ca or not tgt_ca:
-        return None
-
-    tmpl_by_res = {}
-    for (_c, rnum), xyz in tmpl_ca.items():
-        tmpl_by_res.setdefault(rnum, xyz)
-    tgt_by_res = {}
-    for (_c, rnum), xyz in tgt_ca.items():
-        tgt_by_res.setdefault(rnum, xyz)
-
-    P, Q = [], []
-    for k, v in match_dict.items():
-        kp, vp = k.split("."), v.split(".")
-        if len(kp) != 3 or len(vp) != 3:
-            continue
-        try:
-            tmpl_res, tgt_res = int(kp[2]), int(vp[2])
-        except ValueError:
-            continue
-        if interface_residues and tmpl_res not in interface_residues:
-            continue
-        if tmpl_res in tmpl_by_res and tgt_res in tgt_by_res:
-            P.append(tgt_by_res[tgt_res])
-            Q.append(tmpl_by_res[tmpl_res])
-
-    if len(P) < KABSCH_MIN_PAIRS:
-        return None
-    R, t, rmsd = kabsch_superpose(P, Q)
-    return t.tolist(), R.tolist(), rmsd, len(P)
-
-
 def process_pair_for_template(receptor, ligand):
     """Find templates that explain the receptor-ligand interaction."""
     receptor_df = _load_alignment(receptor)
@@ -507,28 +260,12 @@ def process_pair_for_template(receptor, ligand):
         "rejected_template_contact": 0,
         "rejected_clash": 0,
         "rejected_no_interface_contact": 0,
-        "rejected_self_template": 0,
         "accepted": 0,
     }
-
-    # F9 (self-templating leakage, see internship_report_draft.md): exclude
-    # any template whose own PDB entry is the receptor's or the ligand's
-    # target structure. Confirmed on nup (receptor Ca RMSD ~1.17e-14 A, i.e.
-    # an identity transform) and cei (7ceiAB predicting 7CEI) -- the target's
-    # own solved structure is trivially its own best "template", which tells
-    # you nothing about the pipeline's ability to predict an unknown
-    # interaction. Legacy already excludes this case
-    # (transformationFiltering.filtering); new never did.
-    receptor_pdb_id, _ = split_target_id(receptor)
-    ligand_pdb_id, _ = split_target_id(ligand)
-    excluded_pdb_ids = {receptor_pdb_id, ligand_pdb_id}
 
     candidates = []
     shared_templates = set(receptor_df["template"]).intersection(ligand_df["template"])
     for template in shared_templates:
-        if template[:4].lower() in excluded_pdb_ids:
-            stats["rejected_self_template"] += 1
-            continue
         rec_rows = receptor_df[receptor_df["template"] == template].to_dict("records")
         lig_rows = ligand_df[ligand_df["template"] == template].to_dict("records")
         for rec in rec_rows:
@@ -548,13 +285,7 @@ def process_pair_for_template(receptor, ligand):
         f"rej_template_contact={stats['rejected_template_contact']} "
         f"rej_clash={stats['rejected_clash']} "
         f"rej_no_interface_contact={stats['rejected_no_interface_contact']} "
-        f"rej_self_template={stats['rejected_self_template']} "
         f"accepted={stats['accepted']}"
-        + (f" | kabsch_used={stats.get('kabsch_receptor', 0)}/"
-           f"{stats.get('kabsch_ligand', 0)} "
-           f"fallback={stats.get('kabsch_receptor_fallback', 0)}/"
-           f"{stats.get('kabsch_ligand_fallback', 0)}"
-           if TRANSFORM_MODE == "kabsch_interface" else "")
     )
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
@@ -600,30 +331,6 @@ def _evaluate(receptor, ligand, template, rec_align, lig_align, stats=None):
     lig_translation = _parse_vec(lig_align.get("translation"), [0.0, 0.0, 0.0])
     lig_rotation = _parse_vec(lig_align.get("rotation_mat"), [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 
-    rec_kabsch_rmsd = lig_kabsch_rmsd = ""
-    if TRANSFORM_MODE == "kabsch_interface":
-        # Which side of the template's contact list belongs to which target
-        # depends on how the two template chains were assigned this time.
-        side_first, side_second = _interface_residues_by_side(template, _load_contacts(template))
-        if template[4:5] == rec_chain:
-            rec_iface, lig_iface = side_first, side_second
-        else:
-            rec_iface, lig_iface = side_second, side_first
-
-        got = _kabsch_transform(receptor, template, rec_chain, rec_match, rec_iface)
-        if got is not None:
-            rec_translation, rec_rotation, rec_kabsch_rmsd, _n = got
-            _bump("kabsch_receptor")
-        else:
-            _bump("kabsch_receptor_fallback")
-
-        got = _kabsch_transform(ligand, template, lig_chain, lig_match, lig_iface)
-        if got is not None:
-            lig_translation, lig_rotation, lig_kabsch_rmsd, _n = got
-            _bump("kabsch_ligand")
-        else:
-            _bump("kabsch_ligand_fallback")
-
     apply_tm_transform(receptor_input, receptor_output, rec_translation, rec_rotation, keep_chains=set(rec_chains))
     apply_tm_transform(ligand_input, ligand_output, lig_translation, lig_rotation, keep_chains=set(lig_chains))
 
@@ -649,8 +356,6 @@ def _evaluate(receptor, ligand, template, rec_align, lig_align, stats=None):
         "score": score,
         "contacts": contacts,
         "output_pdb": final_output,
-        "kabsch_rmsd_rec": rec_kabsch_rmsd,
-        "kabsch_rmsd_lig": lig_kabsch_rmsd,
     }
 
 

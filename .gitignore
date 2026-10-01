@@ -6,3 +6,9 @@ logs/
 templates/
 processed/
 __pycache__
+templates/
+templates.zip
+processed/
+processed_*/
+*.pdb
+__pycache__/

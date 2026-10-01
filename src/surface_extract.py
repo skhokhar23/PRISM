@@ -5,7 +5,7 @@ from Bio.PDB.Polypeptide import is_aa
 from .sasa_utils import get_asa_complex
 from .utils import distance_calculator
 
-RSATHRESHOLD = 25.0
+RSATHRESHOLD = 15.0
 NEIGHBOR_CA_DISTANCE = 6.0
 
 SURFACE_EXTRACTION_DIR = "processed/surface_extraction"

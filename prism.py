@@ -54,13 +54,36 @@ def main(args):
     if args.refine and passed:
         print("[6a/6] Rosetta refinement")
         refined = refiner(passed)
-        for rec, lig, isc, tsc, op in refined:
+        for rec, lig, isc, tsc, op, _entry in refined:
             print(f"  refined {rec} + {lig}: int={isc} total={tsc} -> {op}")
-        if refined:
-            compare_pairs = [
-                (rec, lig, tpl, out_pdb)
-                for (rec, lig, tpl, _), (_, _, _, _, out_pdb) in zip(passed, refined)
-            ]
+
+        # F10: `passed` can now hold several candidates per (receptor, ligand)
+        # pair (see transformation.py TOP_K_REFINE), so refined rows can no
+        # longer be matched back to `passed` by position -- some candidates
+        # are rejected by refiner()'s own energy gate independently of the
+        # others, which desyncs a positional zip(). Group by the pair identity
+        # carried through in each row's original entry instead, and keep only
+        # the candidate with the best (most negative) interface energy per
+        # pair. This is also the point where "pick by alignment score" (F10's
+        # defect) is finally replaced with "pick by refinement energy", the
+        # same criterion the legacy pipeline uses.
+        best_by_pair = {}
+        for _rec_path, _lig_path, isc, _tsc, out_pdb, entry in refined:
+            rec_id, lig_id, tpl, _combined = entry
+            try:
+                isc_val = float(isc)
+            except (TypeError, ValueError):
+                continue
+            key = (rec_id, lig_id)
+            if key not in best_by_pair or isc_val < best_by_pair[key][0]:
+                best_by_pair[key] = (isc_val, tpl, out_pdb)
+
+        compare_pairs = [
+            (rec_id, lig_id, tpl, out_pdb)
+            for (rec_id, lig_id), (_isc_val, tpl, out_pdb) in best_by_pair.items()
+        ]
+        if not compare_pairs:
+            print("  no candidate cleared refinement for any pair")
 
     print("[6/6] Compare outputs vs native + DockQ")
     if compare_pairs:

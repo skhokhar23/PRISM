@@ -5,16 +5,6 @@ be either:
   - 2-tuples `(receptor_path, ligand_path)`
   - 4-tuples `(receptor_id, ligand_id, template_id, complex_pdb_path)` as
     produced by `transformation.transformer`.
-
-CHANGE LOG
-----------
-2026-08-XX (defect F10): `refiner()` now returns the original input `entry`
-as a 6th tuple element, alongside the existing (receptor_path, ligand_path,
-intscore, totalscore, out_path). Since F10, `transformer()` can send more
-than one candidate per (receptor, ligand) pair to refinement, so the caller
-needs a reliable way to know which pair a given refined row came from --
-position-based matching against the input list stopped being safe once more
-than one candidate per pair could be rejected independently.
 """
 
 import os
@@ -48,13 +38,10 @@ def refiner(passed_pairs):
             right_chains=right_chains,
         )
         if intscore != "-":
-            # F10: carry the original entry through so the caller can trace
-            # this row back to its (receptor, ligand) pair even when several
-            # candidates for the same pair were sent to refinement.
-            rows.append((receptor_path, ligand_path, intscore, totalscore, out_path, entry))
+            rows.append((receptor_path, ligand_path, intscore, totalscore, out_path))
 
     with open(summary_path, "w") as fh:
-        for rec, lig, isc, tsc, op, _entry in rows:
+        for rec, lig, isc, tsc, op in rows:
             fh.write(f"{rec}\t{lig}\t{isc}\t{tsc}\t{op}\n")
     return rows
 
@@ -77,7 +64,7 @@ def calculate_energy(receptor_path, ligand_path, combined_path=None, left_chains
         import pyrosetta
         from pyrosetta.rosetta.core.import_pose import pose_from_file
         from pyrosetta.rosetta.protocols.docking import setup_foldtree
-        from pyrosetta import Vector1
+        from pyrosetta.rosetta.utility import Vector1
     except ImportError as exc:
         print(f"PyRosetta not available: {exc}")
         return "-", "-", "-"
@@ -101,20 +88,14 @@ def calculate_energy(receptor_path, ligand_path, combined_path=None, left_chains
 
         pyrosetta.init(extra_options="-ex1 -ex2aro -ignore_zero_occupancy false -detect_disulf false")
         pose = pose_from_file(combined_path)
-        jump_num = Vector1([1])
+        jump_num = Vector1(1)
         setup_foldtree(pose, partner_chains, jump_num)
 
         try:
             from pyrosetta.rosetta.protocols.docking import DockingPrepackProtocol
-            try:
-                prepack = DockingPrepackProtocol()
-                print("[prepack] no-arg")
-            except TypeError:
-                prepack = DockingPrepackProtocol(jump_num[1])
-                print("[prepack] 1-arg fallback")
+            prepack = DockingPrepackProtocol(jump_num[1])
             prepack.apply(pose)
-        except (ImportError, AttributeError, TypeError, RuntimeError) as exc:
-            print(f"DockingPrepackProtocol unavailable ({exc}); using pack_rotamers fallback")
+        except (ImportError, AttributeError):
             _prepack_with_pack_rotamers(pose)
 
         prepacked_path = os.path.join(ROSETTA_DIR, f"{out_name}_0001.pdb")
@@ -124,22 +105,11 @@ def calculate_energy(receptor_path, ligand_path, combined_path=None, left_chains
             from pyrosetta.rosetta.protocols.docking import DockMCMProtocol
             from pyrosetta import create_score_function
             scorefxn = create_score_function("ref2015")
-            try:
-                dock = DockMCMProtocol(jump_num[1], scorefxn, scorefxn)
-                print("[dock] 3-arg constructor (original signature)")
-            except TypeError:
-                dock = DockMCMProtocol()
-                print("[dock] no-arg constructor; setting score functions explicitly")
-                for setter in ("set_scorefxn", "set_scorefxn_pack"):
-                    try:
-                        getattr(dock, setter)(scorefxn)
-                    except AttributeError:
-                        print(f"[dock] WARNING: {setter} not available -- "
-                              f"that score function stays at Rosetta's default")
+            dock = DockMCMProtocol(jump_num[1], scorefxn, scorefxn)
             try:
                 dock.set_local_refine(True)
             except AttributeError:
-                print("[dock] WARNING: set_local_refine not available")
+                pass
             dock.apply(pose)
         except Exception as exc:
             print(f"DockMCMProtocol failed: {exc}; falling back to perturb+min")
@@ -162,14 +132,6 @@ def calculate_energy(receptor_path, ligand_path, combined_path=None, left_chains
                 print(f"Failed to compute contact map post-refinement: {exc}")
             return str(totalscore), str(interaction_score), final_out_path
 
-        if not os.path.exists(rosetta_out_path):
-            print(f"[reject] {out_name}: no refined structure written")
-        elif interaction_score == "-":
-            print(f"[reject] {out_name}: refined structure exists at {rosetta_out_path} "
-                  f"but interface score could not be computed")
-        else:
-            print(f"[reject] {out_name}: interface score {interaction_score} "
-                  f"above threshold {ROSETTA_INT_SCORE_THRESHOLD}")
         return "-", "-", "-"
 
     except Exception as exc:
@@ -190,28 +152,17 @@ def _compute_scores(pose, jump_num_value, out_name):
                     if len(parts) >= 6:
                         return float(parts[1]), float(parts[5])
                     break
-    scorefxn = pyrosetta.create_score_function("ref2015")
-    total = scorefxn(pose)
-
-    # route 1: docking helper -- scores bound, separates partners, rescores
     try:
-        from pyrosetta.rosetta.protocols.docking import calc_interaction_energy
-        from pyrosetta import Vector1
-        return total, calc_interaction_energy(pose, scorefxn, Vector1([jump_num_value]))
-    except Exception as exc:
-        print(f"calc_interaction_energy unavailable: {exc}")
-
-    # route 2: InterfaceAnalyzerMover
-    try:
-        from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
-        iam = InterfaceAnalyzerMover(jump_num_value)
-        iam.set_compute_packstat(False)
-        iam.apply(pose)
-        return total, iam.get_interface_dG()
-    except Exception as exc:
-        print(f"InterfaceAnalyzerMover unavailable: {exc}")
-
-    return total, "-"
+        from pyrosetta.rosetta.core.scoring import Interface
+        scorefxn = pyrosetta.create_score_function("ref2015")
+        scorefxn(pose)
+        total = pose.energies().total_energy()
+        interface = Interface(jump_num_value)
+        interface.calculate(pose)
+        intscore = interface.interface_energy(pose, scorefxn)
+        return total, intscore
+    except Exception:
+        return "-", "-"
 
 
 def _prepack_with_pack_rotamers(pose):
